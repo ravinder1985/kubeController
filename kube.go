@@ -37,7 +37,7 @@ type KubernetesOps struct {
 	Data Data
 }
 
-// Facts only going to hold Type and Text about facts
+// Facts only going to hold Type and Text about cats
 type Facts struct {
 	Type string
 	Text string
@@ -77,13 +77,12 @@ func (data *Data) InitializeData(url string) bool {
 
 // GetFacts would return facts about cats.
 func (data *Data) GetFacts() string {
-	log.Println(len(data.All))
 	length := len(data.All) + 1
 	rand.Seed(time.Now().UnixNano())
 	return data.All[rand.Intn(length)].Text
 }
 
-func (kubernetesOps *KubernetesOps) startUpdateWorkers(numberOfWorkers int) {
+func (kubernetesOps *KubernetesOps) startUpdatePodsWorkers(numberOfWorkers int) {
 	// Start workers
 	log.Println("Start UpdateFactsWorkers")
 	for i := 0; i < numberOfWorkers; i++ {
@@ -108,11 +107,16 @@ func (kubernetesOps *KubernetesOps) SystemInitialize() (bool, error) {
 		kubernetesOps.UpdateFactsChan = make(chan *corev1.Pod, 10)
 	}
 
-	kubernetesOps.startUpdateWorkers(numberOfWorkers)
-	// Local data to local memory for further use.
-	kubernetesOps.loadData(url)
-
 	var err error
+
+	kubernetesOps.startUpdatePodsWorkers(numberOfWorkers)
+	// Local data to local memory for further use.
+	_, err = kubernetesOps.loadData(url)
+	if err != nil {
+		log.Println("Failed to load facts", err)
+		return false, err
+	}
+
 	kubernetesOps.Configs, err = clientcmd.BuildConfigFromFlags("", kubeConfigLocation)
 	if err != nil {
 		log.Println("Failed to get to Kubernetes Cluster configurations", err)
@@ -129,14 +133,27 @@ func (kubernetesOps *KubernetesOps) SystemInitialize() (bool, error) {
 	return true, nil
 }
 
+// ValidateAndPushForUpdate will validate conditions before push to Queue for update
+func (kubernetesOps *KubernetesOps) ValidateAndPushForUpdate(pod *corev1.Pod) {
+	if pod.Status.Phase == "Running" {
+		annotationsMap := pod.GetAnnotations()
+		// Make sure there is not any cat-fact already exist
+		if _, ok := annotationsMap["cat-fact"]; !ok {
+			log.Println("add/update annotation in -", pod.GetNamespace(), pod.Name, pod.Status.PodIP, pod.Status.HostIP, pod.Status.Phase)
+			// Update only if there is no cat-fact available already
+			kubernetesOps.UpdateFactsChan <- pod
+		}
+	}
+}
+
 // Resync will trigger events every 10 mintue to make sure every pod has a annotations
 func (kubernetesOps *KubernetesOps) Resync() {
 	for {
-		<-time.After(10 * time.Minute)
+		<-time.After(10 * time.Second)
 		log.Println("----- Resync -----")
 		podsList, _ := kubernetesOps.PodInterface.List(v1.ListOptions{})
 		for _, pod := range podsList.Items {
-			kubernetesOps.UpdateFactsChan <- &pod
+			kubernetesOps.ValidateAndPushForUpdate(&pod)
 		}
 	}
 }
@@ -155,14 +172,13 @@ func (kubernetesOps *KubernetesOps) StartEventWatcher() (bool, error) {
 			select {
 			case event := <-watch.ResultChan():
 				switch event.Type {
-				case "ADDED":
+				case "ADDED", "MODIFIED":
 					log.Println("Type: ", event.Type)
 					pod, ok := event.Object.(*corev1.Pod)
 					if !ok {
 						log.Println("Unexpected object type")
 					} else {
-						log.Println("add/update annotation in -", pod.GetNamespace(), pod.Name, pod.Status.PodIP, pod.Status.HostIP)
-						kubernetesOps.UpdateFactsChan <- pod
+						kubernetesOps.ValidateAndPushForUpdate(pod)
 					}
 				default:
 					log.Println("Type: ", event.Type)
@@ -186,11 +202,14 @@ func (kubernetesOps *KubernetesOps) UpdateFactsWorkers(id int) {
 			annotationsMap = make(map[string]string, 1)
 		}
 
+		// fmt.Println("---------", podDetails.ObjectMeta.Namespace, podDetails.Status.ContainerStatuses)
+		// Double check in case messages are comming from the different system and there is not any validation for cat-facts
 		if _, ok := annotationsMap["cat-fact"]; !ok {
 			// Copy the object so we wont change anything to original object in case its getting used somewhere else.
 			podDetailsCopy := podDetails.DeepCopy()
 			annotationsMap["cat-fact"] = kubernetesOps.Data.GetFacts()
 			podDetailsCopy.ObjectMeta.Annotations = annotationsMap
+
 			_, err := kubernetesOps.ClientSet.CoreV1().Pods(podDetailsCopy.ObjectMeta.Namespace).Update(podDetailsCopy)
 			if err != nil {
 				fmt.Println("unable to update pod ", podDetailsCopy.ObjectMeta.Name, "in namespace", podDetailsCopy.ObjectMeta.Namespace, err)
