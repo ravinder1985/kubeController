@@ -149,7 +149,7 @@ func (kubernetesOps *KubernetesOps) ValidateAndPushForUpdate(pod *corev1.Pod) {
 // Resync will trigger events every 10 mintue to make sure every pod has a annotations
 func (kubernetesOps *KubernetesOps) Resync() {
 	for {
-		<-time.After(10 * time.Second)
+		<-time.After(10 * time.Minute)
 		log.Println("----- Resync -----")
 		podsList, _ := kubernetesOps.PodInterface.List(v1.ListOptions{})
 		for _, pod := range podsList.Items {
